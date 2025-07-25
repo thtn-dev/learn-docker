@@ -95,20 +95,11 @@ jobs:
             # Tag với SHA commit
             type=sha,prefix={{branch}}-
 
-      # Security scan với Trivy trước khi build
-      - name: Run Trivy vulnerability scanner trên Dockerfile
-        uses: aquasecurity/trivy-action@master
-        with:
-          scan-type: 'config'
-          scan-ref: 'dockerfile/expressjs/dockerfile'
-          format: 'sarif'
-          output: 'trivy-results.sarif'
-
       # Build và push Docker image
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: dockerfile/expressjs
           file: dockerfile/expressjs/dockerfile
           platforms: linux/amd64,linux/arm64
           # Chỉ push khi không phải pull request
