@@ -104,13 +104,6 @@ jobs:
           format: 'sarif'
           output: 'trivy-results.sarif'
 
-      # Upload security scan results
-      - name: Upload Trivy scan results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-results.sarif'
-
       # Build và push Docker image
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
@@ -165,12 +158,6 @@ jobs:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: 'sarif'
           output: 'trivy-image-results.sarif'
-
-      - name: Upload image scan results
-        if: github.event_name != 'pull_request'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: 'trivy-image-results.sarif'
 
       # Generate image digest cho security
       - name: Generate image digest
