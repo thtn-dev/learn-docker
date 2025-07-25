@@ -1,0 +1,213 @@
+# GitHub Action để build Docker image và publish lên GitHub Container Registry
+# Workflow này sẽ build image cho cả Linux AMD64 và ARM64 platforms
+
+name: Build and Push Docker Image
+
+on:
+  # Trigger khi có push vào main branch
+  push:
+    branches: [ "main" ]
+  
+  # Trigger khi có pull request vào main
+  pull_request:
+    branches: [ "main" ]
+  
+  # Cho phép chạy manual workflow
+  workflow_dispatch:
+
+# Định nghĩa environment variables cho toàn bộ workflow
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Job để lint Dockerfile trước khi build
+  lint-dockerfile:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Lint Dockerfile với Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: dockerfile/expressjs/dockerfile
+          failure-threshold: error
+
+  # Main job để build và push image
+  build-and-push:
+    runs-on: ubuntu-latest
+    # Chỉ chạy sau khi lint thành công
+    needs: lint-dockerfile
+    
+    # Cấp quyền cần thiết để write vào packages
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch full history 
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          # Chỉ setup platforms cần thiết để tăng tốc
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Enable advanced BuildKit features
+          driver-opts: |
+            network=host
+
+      # Login vào GitHub Container Registry
+      - name: Log in to Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract metadata cho tags và labels
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # Định nghĩa tag strategy
+          tags: |
+            # Tag với branch name cho push vào branches
+            type=ref,event=branch
+            # Tag với PR number cho pull requests  
+            type=ref,event=pr
+            # Tag semantic versioning cho tags
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # Tag latest cho main branch
+            type=raw,value=latest,enable={{is_default_branch}}
+            # Tag với SHA commit
+            type=sha,prefix={{branch}}-
+
+      # Security scan với Trivy trước khi build
+      - name: Run Trivy vulnerability scanner trên Dockerfile
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: 'dockerfile/expressjs/dockerfile'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      # Upload security scan results
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # Build và push Docker image
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: dockerfile/expressjs/dockerfile
+          platforms: linux/amd64,linux/arm64
+          # Chỉ push khi không phải pull request
+          push: ${{ github.event_name != 'pull_request' }}
+          # Sử dụng tags từ metadata step
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Enable cache để tăng tốc builds
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Build arguments có thể hữu ích
+          build-args: |
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+            VCS_REF=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.version }}
+
+      # Test image đã build (chỉ cho amd64 để tiết kiệm thời gian)
+      - name: Test Docker image
+        if: github.event_name != 'pull_request'
+        run: |
+          # Load image để test locally
+          docker run --rm -d \
+            --name test-container \
+            --publish 3000:3000 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          
+          # Đợi container start up
+          sleep 10
+          
+          # Test health check endpoint
+          if curl -f http://localhost:3000/health || curl -f http://localhost:3000; then
+            echo "✅ Container health check passed"
+          else
+            echo "❌ Container health check failed"
+            docker logs test-container
+            exit 1
+          fi
+          
+          # Cleanup
+          docker stop test-container
+
+      # Scan image đã build để tìm vulnerabilities
+      - name: Run Trivy vulnerability scanner trên image
+        if: github.event_name != 'pull_request'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          format: 'sarif'
+          output: 'trivy-image-results.sarif'
+
+      - name: Upload image scan results
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-image-results.sarif'
+
+      # Generate image digest cho security
+      - name: Generate image digest
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "## 📦 Docker Image Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** \`${{ env.REGISTRY }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** \`${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Tags:** \`${{ steps.meta.outputs.tags }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Pull command:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+  # Job để update documentation nếu cần
+  update-docs:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update README với image information
+        run: |
+          # Tự động update README.md với thông tin image mới
+          sed -i "s|<!-- IMAGE_TAG_START -->.*<!-- IMAGE_TAG_END -->|<!-- IMAGE_TAG_START -->ghcr.io/${{ github.repository }}:latest<!-- IMAGE_TAG_END -->|g" README.md || true
+
+      - name: Commit và push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md || true
+          git diff --staged --quiet || git commit -m "docs: update Docker image reference [skip ci]"
+          git push || true
